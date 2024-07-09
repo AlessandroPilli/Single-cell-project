@@ -43,13 +43,13 @@ library(HGNChelper) #contains functions for identifying and correcting HGNC huma
 
 ## 0.2 Wordking directory
 ```{r working directory, include=FALSE}
-# setwd("C:/Users/alepi/OneDrive/Desktop/university/second_year/second_semester/singlecells_spatialomics/5_unknown/")
+# setwd("Your/working/directory")
 ```
 
 ## 0.3 Reading in the raw data. 
 ```{r load_data, warning=F,message=F}
 
-raw_data <- readRDS("EMZ.rds") 
+raw_data <- readRDS("./data/EMZ.rds") 
 
 ```
 
@@ -610,24 +610,6 @@ Other plots reporting the same results not shown
 # DotPlot(data, features = list_of_markers)
 ```
 
-```{r marker_comparisons, include=FALSE}
-
-# # cluster 1
-# FeaturePlot(data, c("Slc39a1", "4921513D23Rik"))
-# # cluster 2
-# FeaturePlot(data, c("Olfml3", "Ywhah"))
-# #cluster 3
-# FeaturePlot(data, c("Fos", "Jun"))
-# #cluster 4
-# FeaturePlot(data, c("Rtp4", "Ifit3"))
-# #cluster 5
-# FeaturePlot(data, c("Ccl4", "Lpl"))
-# # cluster 6
-# FeaturePlot(data, c("H2-Ab1", "Cd74"))
-
-```
-
-
 ```{r heatmap_of_markers, warning=F,message=F, fig.align='center'}
 DoHeatmap(data, features = list_of_markers)
 ```
@@ -640,8 +622,8 @@ Integrative analysis can align common cell types and states across multiple data
 
 ## 8.1 loading second dataset 
 ```{r, warning=F,message=F}
-XUR <- readRDS("XUR.rds")
-EMZ <- readRDS("EMZ.rds") 
+XUR <- readRDS("./data/XUR.rds")
+EMZ <- readRDS("./data/EMZ.rds") 
 ```
 
 
