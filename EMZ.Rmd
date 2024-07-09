@@ -1,0 +1,905 @@
+---
+title: "Single cell RNA-Seq analysis"
+author: "Alessandro Pilli"
+date: "10/07/2024"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: inline
+---
+Analysis of the unknown dataset ‘EMZ’
+
+# 0. packages and data loading
+
+## 0.1 Load the necessary packages to perform the analysis
+
+```{r load_packages,warning=F,message=F}
+
+library(tidyverse) # collection of packages for tidy data analysis (ggplot, dplyr, ...)
+library(Seurat) # single cell analysis
+library(patchwork) # combine separate ggplots into the same graphic
+library(sctransform)
+library(gprofiler2)
+library(celldex)
+library(dplyr)
+library(HGNChelper)
+library(openxlsx)
+library(SingleR)
+library(Matrix)
+library(glmGamPoi)
+library(plotly)
+library(SummarizedExperiment) 
+library(SingleCellExperiment)
+library(dbplyr)
+library(pheatmap)
+#library(presto)
+library(SeuratObject)
+library(irlba)
+library(RColorBrewer)
+library(gridExtra) # plot displacement
+library(HGNChelper) #contains functions for identifying and correcting HGNC human gene symbols and MGI mouse gene symbols 
+```
+
+## 0.2 Wordking directory
+```{r working directory, include=FALSE}
+# setwd("C:/Users/alepi/OneDrive/Desktop/university/second_year/second_semester/singlecells_spatialomics/5_unknown/")
+```
+
+## 0.3 Reading in the raw data. 
+```{r load_data, warning=F,message=F}
+
+raw_data <- readRDS("EMZ.rds") 
+
+```
+
+## 0.4 First inspection
+
+Initiate the **Seurat object** with the digital count matrix. 
+A first inspection revealed that the matrix is composed of 23433 features across 1961 cells
+
+```{r create_seurat_raw, warning=F, message=F}
+
+data <- CreateSeuratObject(counts = raw_data)
+
+data
+```
+
+## 0.5 Preliminary filtering
+
+Initial filtration is executed to eliminate, at the gene level, genes expressed in fewer than three cells and, at the cell level, cells with fewer than 50 features.
+
+```{r create_seurat, warning=F, message=F}
+data <- CreateSeuratObject(counts = raw_data, 
+                           project = "data", # name of the project
+                           min.cells = 3,   # filter for genes (rows)
+                           min.features = 50 # filter for cells (columns)
+                           )
+data
+```
+
+The resulting object now comprehend data that include 17982 number of features across the same number of cells (1961)
+
+# 1. Quality control and filtering
+
+In this section, standard methods of quality control and filtering are employed to derive a refined data matrix.
+
+## 1.1 Filtering Based on Mitochondrial, Ribosomal, and Spike-in RNA Genes
+
+Genes with an elevated count mapping to mitochondrial genomes are filtered out, as heightened mitochondrial gene expression often signifies low-quality or deteriorating cells.
+The function PercentageFeatureSet is utilized to determine the proportion of counts originating from specific sets of features, such as genes commencing with "MT-" denoting mitochondrial genes.
+Similarly, the proportion of gene expression originating from ribosomal proteins is computed using analogous methods. Furthermore, the proportion of expression derived from spike-in RNAs, all commencing with "ERCC" and serving as an alternative quality control measure, is assessed in a comparable manner (ERCC stands for External RNA Controls Consortium).
+
+```{r qc_metrics, warning=F, message=F}
+# The [[ operator can add columns to the object meta.data, ideal to stash QC stats
+data[["percent_mt"]] <- PercentageFeatureSet(data, pattern = "^mt-")
+data[["percent_ribo"]] <- PercentageFeatureSet(data, "^rp[SL]")
+data[["percent_ERCC"]] <- PercentageFeatureSet(data, "^ERCC")
+data$log10GenesPerUMI <- log10(data$nFeature_RNA)/log10(data$nCount_RNA)
+
+# Show QC metrics for the first 5 cells
+head(data@meta.data, 5)
+
+# sum(data$percent_mt) # = 0
+# sum(data$percent_ribo) # = 0
+```
+The percentage of ribosomal protein is zero indicating the absence of probable dieing cells.
+
+As mitochondrial genes were absent from the digital count matrix, I leveraged spike-in RNAs as a substitute parameter. Additionally, I calculated the complexity score to gauge the dataset's complexity, utilizing it as an additional parameter in the filtering process.
+
+## 1.2 Visualize QC metrics as a violin plot
+
+```{r QC_violin, fig.align='center', warning=F, message=F}
+
+VlnPlot(data, features = c("nFeature_RNA","percent_ERCC", "log10GenesPerUMI"))
+
+```
+
+This gives an idea on the actual complexity of the dataset
+
+```{r QC_scatter, fig.height=4, fig.width=10, warning=F, message=F, fig.align='center'}
+
+plot1 <- FeatureScatter(data, feature1 = "nCount_RNA", feature2 = "percent_ERCC")
+plot2 <- FeatureScatter(data, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+
+```
+
+## 1.3 Optimal parameters via graphs
+
+The count of unique genes (nFeature_RNA) and total molecules (nCount_RNA) is automatically computed during the creation of the Seurat object.
+
+From the plot, it is apparent that we are encountering instances where some of the data points exhibit extreme values, suggesting a need for filtering. To address this, I conducted an analysis of the distribution of the following parameters for each cell: the number of genes, the percentage of spike-in RNAs detected, and the computed complexity score.
+
+```{r distribution of the number of genes detected, warning = F, message = F, fig.align="center", fig.width= 10, fig.height= 5}
+DistrFeature_plot <- data[[]] %>% 
+    ggplot(aes(x=nFeature_RNA, color = orig.ident, fill = orig.ident )) + 
+    geom_density(alpha = 0.2) + 
+    scale_x_log10() + 
+    theme_classic() +
+    ylab("Cell density") +
+    geom_vline(xintercept = 1000) + geom_vline(xintercept = 7500)
+
+# distribution of the complexity
+DistrComplexity_plot <- data[[]] %>% 
+    ggplot(aes(x=log10GenesPerUMI, color = orig.ident, fill = orig.ident )) + 
+    geom_density(alpha = 0.2) + 
+    scale_x_log10() + 
+    theme_classic() +
+    ylab("Cell density") +
+    geom_vline(xintercept = 0.45) + geom_vline(xintercept = 0.7)
+
+# distribution of the spike-in RNAs
+DistrERCC_plot <- data[[]] %>% 
+    ggplot(aes(x=percent_ERCC, color = orig.ident, fill = orig.ident )) + 
+    geom_density(alpha = 0.2) + 
+    scale_x_log10() + 
+    theme_classic() +
+    ylab("Cell density") +
+    geom_vline(xintercept = 5)
+
+# distribution of MT
+# DistrMT_plot <- data[[]] %>% 
+#     ggplot(aes(x=percent_mt, color = orig.ident, fill = orig.ident )) + 
+#     geom_density(alpha = 0.2) + 
+#     scale_x_log10() + 
+#     theme_classic() +
+#     ylab("Cell density") +
+#     geom_vline(xintercept = 7.5)
+
+DistrFeature_plot + DistrComplexity_plot + DistrERCC_plot  # + DistrMT_plot
+```
+
+## 1.4 Fianl filtering
+
+Upon examining the distributions, I opted to retain cells meeting specific criteria: a minimum of 100 features and a maximum of 10000, a percentage of spike-in RNAs below 5%, and a complexity score between 0.45 and 0.7.
+
+```{r subset}
+data <- subset(data, subset = nFeature_RNA > 1000 & nFeature_RNA < 7500 &
+                  percent_ERCC < 5 &
+                  log10GenesPerUMI < 0.7 & log10GenesPerUMI > 0.45)
+data
+
+```
+
+## 1.5 New plots after filtering
+
+After this filtering we can see that the number of retained cell is decreased from 1961 to 1422 
+
+```{r qc_scatter_after_filtering, fig.align='center', fig.height=4, fig.width=10, warning=F, message=F}
+
+
+plot1 <- FeatureScatter(data, feature1 = "nCount_RNA", feature2 = "percent_ERCC")
+plot2 <- FeatureScatter(data, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+
+```
+
+Looking now at the plots describing the filtered data, we can see that all the extreme dots have been filter out.
+
+```{r QC_violin_after_filtering, fig.align='center', fig.height=4, fig.width=10, warning=F, message=F}
+
+VlnPlot(data, features = c("nFeature_RNA","percent_ERCC", "log10GenesPerUMI"))
+
+```
+
+Also the complexity that we visualized before is clearly decreased as shown in these final violin plots
+
+
+# 2. Normalization, identification of variable features, and scaling
+
+## 2.1 Normalize data
+
+Following the removal of unwanted cells from the dataset, the next step is normalization.
+
+By default, Seurat employs a global-scaling normalization method called "LogNormalize." 
+However, an alternative normalization method called SCTransform have been chosen in this analysis. SCTransform automatically performs normalization, scaling, and computation of the most valuable features. The selected method is glmGamPoi, which significantly accelerates the learning procedure.
+
+
+```{r normalization, warning=F, message=F, results='hide'}
+
+# data <- NormalizeData(data,
+                      # normalization.method = "LogNormalize",
+                      # scale.factor = 10000)
+
+
+data <- SCTransform(data, method = "glmGamPoi") #second method
+```
+
+
+## 2.2 Identification of highly variable features (feature selection)
+
+Next, we proceed to select a subset of features (genes) that display substantial cell-to-cell variation within the dataset. These features are characterized by being highly expressed in some cells while being lowly expressed in others. Prioritizing these genes in downstream analysis enhances the detection of biological signals in single-cell datasets.
+
+The process for selecting variable features is executed using the FindVariableFeatures function, which models the mean-variance relationship intrinsic to single-cell data. By default, the function identifies the 3000 most variable features per dataset. As reported above the SCTransform function automatically identify them and so are already reported via teh function VariableFeatures on the dataset.  
+
+```{r variable_features, warning=F, message=F}
+# first line not necessary since SCTranform used
+
+# data <- FindVariableFeatures(data,
+                             # selection.method = "vst",
+                             # nfeatures = 2000)
+
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(data), 10)
+
+top10
+```
+
+```{r variable_features_plot, fig.height=5, fig.width=10, fig.align='center', warning=F, message=F}
+# plot variable features with labels
+plot1 <- VariableFeaturePlot(data)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot2
+
+```
+
+In the Feature Plot, we observe the 3000 identified variable features, with the top 10 features labeled. Upon inspecting the names of the identified variable genes, it is discernible that the dataset likely originates from a mouse sample. This inference is drawn from the observation that mouse gene symbols typically feature the first letter capitalized followed by lower case letters, whereas human gene symbols are typically represented in all uppercase letters.
+
+## 2.3 Scaling the data (not needed since SCTranform have been selected as the main method)
+
+Through scaling, Seurat implements a linear transformation on the expression levels of each gene, serving as a standard preprocessing step before employing dimensional reduction techniques.
+
+The ScaleData function undertakes the following:
+
+- Shifts the expression of each gene so that the mean expression across cells is 0.
+- Scales the expression of each gene so that the variance across cells is 1.
+
+This process ensures equal weighting in downstream analyses, preventing highly expressed genes from dominating the results.
+
+```{r scaling, warning=F, message=F}
+
+# perform scaling on all genes (by default, only the top 2000 are scaled)
+# all_genes <- rownames(data)
+# 
+# data <- ScaleData(data,
+#                   features = all_genes)
+```
+
+# 3. Cell Cycle Analysis (Really needed?)
+
+## 3.1 Cell cycle scores
+
+I have decided to conduct an analysis of the cells’ proliferation status prior to clustering, as the cell cycle phase can introduce bias. I will utilize the difference between the assigned S score and G2M score of each cell (CC.Difference) as a variable to regress out during the following normalization step, following the recommendation by Seurat Developers. This approach ensures that signals distinguishing between non-cycling cells and cycling cells are retained, while differences in cell cycle phase among proliferating cells are mitigated by regressing them out of the data.
+
+The presence of cell cycle heterogeneity within scRNA-seq data can introduce variability. If the experiment does not specifically focus on the cell cycle, strategies can be implemented to address this heterogeneity. In Seurat, managing cell cycle effects involves computing phase scores using established markers and subsequently removing them during data preprocessing to mitigate the impact of cell cycle heterogeneity on scRNA-seq data.
+
+```{r cell_cycle_filtering, echo=TRUE, results= 'hide', warning=F, message=F}
+# markers
+m_s.genes <- gorth(cc.genes.updated.2019$s.genes, source_organism = "hsapiens", target_organism = "mmusculus")$ortholog_name
+m_g2m.genes <- gorth(cc.genes.updated.2019$g2m.genes, source_organism = "hsapiens", target_organism = "mmusculus")$ortholog_name
+
+# computing the cell cycle scoring
+data <- CellCycleScoring(data, s.features = m_s.genes, g2m.features = m_g2m.genes, set.ident = TRUE)
+
+# new column
+data$CC.Difference <- data$S.Score - data$G2M.Score
+
+# subset
+data[[]] %>% 
+  dplyr::select(Phase, S.Score, G2M.Score, CC.Difference)
+```
+
+```{r ,warning=F,message=F}
+table(data$Phase)
+```
+The cells seems almast equally spread between the phases G1 and S and less regarding G2M phase
+
+## 3.2 Pre regression PCA
+
+So lets save an image of the value before the regression based on this scores performing a simple PCA
+```{r PCA_pre_reg, fig.height=4, fig.width=8, fig.align='center', warning=F, message=F}
+data <- RunPCA(data, features = c(m_s.genes, m_g2m.genes), verbose = F)
+pre_regress_pca <- DimPlot(data, reduction = "pca", group.by = "Phase")
+pre_regress_pca
+```
+
+As shown the values are condensed without a clear separation
+
+
+
+## 3.3 Regressing out (not needed due to the unexisting separation between the groups)
+
+```{r regression, results='hide'}
+
+# data <- ScaleData(data, vars.to.regress = c("S.Score", "G2M.Score"))
+
+# data <- SCTransform(data, vars.to.regress = c("percent_ERCC", "CC.Difference"), verbose = T, method = "glmGamPoi")
+```
+
+
+# 4. Dimensionality reduction
+
+## 4.1 How many dimensions to use?
+
+Dimensionality reduction techniques are utilized to decrease data complexity in subsequent analyses, such as clustering, and for data visualization purposes.
+
+Principal component analysis (PCA) was employed for dimensionality reduction on the processed data.
+
+```{r PCA_post_reg, include=FALSE}
+# data <- RunPCA(data, features = c(m_s.genes, m_g2m.genes), verbose = F)
+# # saveRDS(data, file = "./data_processed")
+# elbow_p <- ElbowPlot(data, ndims = 50)
+# post_regress_pca <- DimPlot(data, reduction = "pca", group.by = "Phase")
+# 
+# elbow_p
+```
+
+```{r, fig.height=4, fig.width=8, fig.align='center', warning=F, message=F}
+data <- RunPCA(data, verbose = F)
+elbow_p <- ElbowPlot(data, ndims = 50)
+
+elbow_p
+```
+
+By exploiting the elbow plot we can determine that the first 15-20 components seem to explain most of the variance in my dataset (picked 20 for future steps).
+
+```{r, fig.height=5, fig.width=8, fig.align='center', warning=F, message=F}
+VizDimLoadings(data, dims = 1:2, reduction = "pca")
+```
+
+Genes capturing the most variance in the data
+
+## 4.2 Post regression PCA
+
+```{r post_regress_pcs}
+# pre_regress_pca + post_regress_pca
+
+# post_regress_pca + ggplot2::coord_cartesian(xlim = c(-20, 10), ylim = c(-10, 20))
+```
+
+Performing this step was producing the same plot as the pre one shown before
+
+This preliminary PCA is so used to speed up the process of t-SNE and UMAP by evaluating a number of relevant dimensions.
+
+
+# 5. Clustering the cells
+
+The graph-based clustering approach involves utilizing a distance metric based on previously identified principal components (PCs) to drive the clustering analysis. The process of partitioning the cellular distance matrix into clusters follows these steps:
+
+- first, cells are embedded in a graph structure, such as a K-nearest neighbor (KNN) graph, where edges are drawn between cells exhibiting similar feature expression patterns 
+- next, the graph is partitioned into highly interconnected 'quasi-cliques' or 'communities'
+
+In Seurat, this process begins with the construction of a KNN graph based on the Euclidean distance in PCA space. The edges between any two cells are refined based on the shared overlap in their local neighborhoods, determined by Jaccard similarity. This step is executed using the FindNeighbors function, which takes as input the previously defined dimensionality of the dataset (the first 20 PCs).
+
+To cluster the cells, a modularity optimization technique (Louvain algorithm) is applied iteratively to group cells together. The FindClusters function implements this procedure and includes a resolution parameter that controls the 'granularity' of the downstream clustering. Setting this parameter to 0.1, returns a total number of clusters of 11 (with default 0.5 the number of clusters was 15), similar to those found during annotation with scType later (9 clusters).
+
+## 5.1 Finding neighbors
+```{r clustering, warning=F, message=F}
+
+data <- FindNeighbors(data, dims = 1:20)
+data <- FindClusters(data, resolution = 0.1)
+
+```
+
+
+## 5.2 Running non-linear dimensional reduction for visualization (tSNE/UMAP)
+
+The goal of these algorithms is to learn the underlying manifold of the data in order to place similar cells together in low-dimensional space and be as structurally similar as possible.
+
+### 5.2.1 Visualization with tSNE (t-Stochastic Neighbourhood Embedding)
+
+```{r tsne, fig.height=5, fig.width=8, fig.align='center', warning=F, message=F}
+
+data <- RunTSNE(data, dims = 1:20, dim.embed = 3)
+tsne_p <- DimPlot(data, reduction = "tsne", label = T)
+tsne_p
+
+
+
+# Create a 3D scatter plot for fun
+
+# plot_ly(data = as.data.frame(data@reductions$tsne@cell.embeddings), 
+#         x = ~tSNE_1, y = ~tSNE_2, 
+#         type = "scatter", mode = "markers",color = data@meta.data[["seurat_clusters"]], colors = c("red", "green", "blue", "orchid", "black", "indianred", "gold", "grey", "darkorange", "skyblue"))
+
+# plot_ly(data = as.data.frame(data@reductions$tsne@cell.embeddings), 
+#         x = ~tSNE_1, y = ~tSNE_2, z = ~tSNE_3, 
+#         type = "scatter3d", mode = "markers", color = data@meta.data[["seurat_clusters"]], colors = c("red", "green", "blue", "orchid", "black", "indianred", "gold", "grey", "darkorange", "indianred", "skyblue"), size = 15)
+
+plot_ly(data = as.data.frame(data@reductions$tsne@cell.embeddings), 
+        x = ~tSNE_1, y = ~tSNE_2, z = ~tSNE_3, 
+        type = "scatter3d", mode = "markers", color = data@meta.data[["seurat_clusters"]], colors = brewer.pal(n = 10, name = "Set1"), size = 15)
+
+```
+
+### 5.2.2 Visualization  with UMAP (Uniform Manifold Approximation and Projection)
+
+```{r umap, fig.height=4, fig.width=10, fig.align='center', warning=F, message=F}
+data <- RunUMAP(data, dims = 1:20)
+umap_p <- DimPlot(data, reduction = "umap",label=T )
+
+
+tsne_p + umap_p
+```
+
+# 6. Predict cell type (cell type annotation)
+
+## 6.1 SingleR
+
+We will use one of the references created by the authors of SingleR.
+```{r load_reference,warning=F,message=F}
+# Loading Mouse dataset
+ref <- MouseRNAseqData()
+
+# View(as.data.frame(colData(ref)))
+
+# table(ref@meta.data$label.main)
+
+```
+
+We predict cell types using the SingleR() function. 
+
+It is possible to use also a list of reference datasets. In this case only genes shared across the reference datasets will be used. 
+
+If fine.tune = TRUE additional fine-tuning step is performed to improve resolution and remove low-quality labels. 
+```{r cell_type_prediction,warning=F,message=F}
+
+predictions <- SingleR(test=data[["SCT"]]$scale.data, #normalized counts of the unknown dataset
+                        clusters = data@meta.data$seurat_clusters, #vector of cluster identities for each cell 
+                        ref=ref, #normalized counts of the reference dataset
+                        labels = ref$label.main,
+                        fine.tune = TRUE) 
+
+#DataFrame  containing the annotation statistics for each cluster (one cluster per row). Delta.next = a numeric vector containing the difference between the best and next-best score
+predictions
+
+predictions_df<-data.frame(cluster=rownames(predictions),labels=predictions$labels)
+```
+
+plotScoreHeatmap() displays the correlation-based scores for all clusters across all reference labels. Each cluster is a column while each row is a label in the reference dataset. The final label for each cluster is shown in the top color bar. Similar scores for a group of labels indicates that the assignment is uncertain for those columns.
+
+```{r scores_heatmap, warning=F, message=F, fig.align='center', fig.width=8, fig.height=5}
+
+plotScoreHeatmap(predictions)
+
+```
+
+The majority of the cells are reported to be brain related without onknown, so we can infere that BRAIN is the tissue from which our data are coming from.
+
+Add cell types labels to the Seurat object
+```{r cell_type_label, fig.width=8, fig.height=10, fig.height=4, fig.align='center'}
+data[["SingleR_labels"]] <- predictions_df$labels[match(data@meta.data$seurat_clusters, predictions_df$cluster)]
+
+DimPlot(data, group.by = "SingleR_labels")
+```
+
+## 6.3 scType (Marker-based automatic annotation)
+
+Marker-based automatic annotation labels cells or cell clusters based on the characteristic expression of known marker genes. Set of marker genes can be obtained from databases (PanglaoDB, CellMarker, CellTypist ...) or manually from the literature.
+
+To be successful, the marker gene or gene set (a collection of marker genes) should be specifically and consistently expressed in a given cell, cluster or class of cells. Marker-based automatic annotation works well once a relevant and sufficiently large set of marker genes is collected
+
+
+ScType accepts both positive and negative markers, i.e., gene that are not expected to be expressed in a particular cell type. Sctype provides its own marker database for human and mouse, obtained from the integration of the information available in the CellMarker database (http://biocc.hrbmu.edu.cn/CellMarker/) and PanglaoDB (https://panglaodb.se).
+In total, the current version of the ScType database comprises 3,980 cell markers for 194 cell types in 17 human tissues and 4,212 cell markers for 194 cell types in 17 mouse tissues.
+
+scType cell_type annotation:
+
+1.For each positive/negative marker compute specificity score, which indicate whether a gene is a marker for a specific cell types.
+2. The raw expression matrix is normalized and Z-transform (scale the expression of each gene across cells)
+3. The transformed matrix is multiply by the cell-type specificity score
+4. For each cell types the expression scores of all its positive markers are summarized into a single enrichment score by summing them and dividing by square root of their number. The same is done for the negative markers.
+5. The negative marker expression score is subtracted from the positive score to obtain the final enrichment score. Individual cells are assigned to a cell type based on the maximum value for the cell type marker set.
+
+
+Prepare marker genes to use for the annotation. By default, scType use the in-built cell marker DB, however, any marker genes data can be used.
+```{r marker_db, warning=FALSE}
+# DB file
+db_ <- "https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/ScTypeDB_full.xlsx";
+tissue <- "Brain" # e.g. Immune system,Pancreas,Liver,Eye,Kidney,Brain,Lung,Adrenal,Heart,Intestine,Muscle,Placenta,Spleen,Stomach,Thymus 
+
+# load gene set preparation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/gene_sets_prepare.R")
+# prepare gene sets
+gs_list <- gene_sets_prepare(db_, tissue)
+gs_list[["gs_positive"]][5:8] #positive markers
+gs_list[["gs_negative"]][5:8] #negative markers = 0
+
+```
+
+```{r}
+# load cell type annotation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_score_.R")
+
+es.max <- sctype_score(scRNAseqData = data[["SCT"]]$scale.data, scaled = TRUE, gs = gs_list$gs_positive, gs2 = NULL) # in case there are no negative markers just set gs2 = NULL
+
+# merge by cluster
+cL_resutls <- do.call("rbind", lapply(unique(data@meta.data$seurat_clusters), function(cl){
+    es.max.cl = sort(rowSums(es.max[ ,rownames(data@meta.data[data@meta.data$seurat_clusters==cl, ])]), decreasing = !0)
+    head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(data@meta.data$seurat_clusters==cl)), 10)
+}))
+sctype_scores <- cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)  
+
+# set low-confident (low ScType score) clusters to "unknown"
+sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/4] <- "Unknown"
+print(sctype_scores[,1:3])
+```
+Assign cell types to each cluster
+```{r, fig.align='center', fig.width=8}
+data[["scType_labels"]] <- sctype_scores$type[match(data@meta.data$seurat_clusters, sctype_scores$cluster)]
+
+DimPlot(data, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'scType_labels')        
+
+```
+ 
+```{r wrapper_function,  warning=F, include=FALSE}
+# # Wrapped function (not working)
+# #get cell-type by cell matrix
+# source("https://raw.githubusercontent.com/kris-nader/sc-type/master/R/sctype_wrapper.R")
+# 
+# data <- run_sctype(data, known_tissue_type="Brain", custom_marker_file ="https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/ScTypeDB_full.xlsx",name="scType_labels",plot=TRUE)
+```
+
+
+```{r annotation_comparison, fig.width=20, fig.height=8}
+plot1 <- DimPlot(data, reduction = "umap", group.by = 'SingleR_labels')  
+plot2 <- DimPlot(data, reduction = "umap", group.by = 'scType_labels')
+
+plot1 + plot2
+```
+
+# 7. Finding differentially expressed features (cluster biomarkers)
+
+Seurat offers the functionality to discover markers that define clusters through differential expression analysis.
+
+The FindAllMarkers function automates this process by comparing each cluster against every other one. It can also test groups of clusters against each other or against all cells.
+
+Although adjusting the min.pct parameter didn't yield different results, I've kept it at the standard value of 0.1 to prioritize a faster process.
+
+```{r all_markers, warning=F, message=F, max.print=50}
+
+# markers <- FindAllMarkers(data,
+#                                only.pos = TRUE,
+#                                min.pct = 0.1,
+#                                logfc.threshold = 0.25)
+# 
+# 
+# top_markers <- markers %>%
+#   group_by(cluster) %>%
+#   arrange(p_val_adj) %>%
+#   filter(!is.na(avg_log2FC)) %>%
+#   slice_max(n=1,order_by=avg_log2FC)
+# 
+# save(markers, top_markers, file = "./markers.RData")
+
+load("markers.RData")
+
+top_markers
+
+list_of_markers <-  top_markers$gene
+
+list_of_markers
+
+
+```
+
+## 7.1 Visualizing marker genes
+
+Here, we are generating a graphical visualization of some of the genes identified in the previous summary. Unfortunately not all markers are largely expressed and can be considered relevant for some cluster.
+
+```{r marker_plots, fig.width=10, fig.height=8, fig.align='center'}
+VlnPlot(data, features = list_of_markers, pt.size = 0)
+FeaturePlot(data, features = list_of_markers)
+```
+
+Other plots reporting the same results not shown
+```{r, fig.width=10, fig.height=8, fig.align='center'}
+# RidgePlot(data,features = list_of_markers)
+# DotPlot(data, features = list_of_markers)
+```
+
+```{r marker_comparisons, include=FALSE}
+
+# # cluster 1
+# FeaturePlot(data, c("Slc39a1", "4921513D23Rik"))
+# # cluster 2
+# FeaturePlot(data, c("Olfml3", "Ywhah"))
+# #cluster 3
+# FeaturePlot(data, c("Fos", "Jun"))
+# #cluster 4
+# FeaturePlot(data, c("Rtp4", "Ifit3"))
+# #cluster 5
+# FeaturePlot(data, c("Ccl4", "Lpl"))
+# # cluster 6
+# FeaturePlot(data, c("H2-Ab1", "Cd74"))
+
+```
+
+
+```{r heatmap_of_markers, warning=F,message=F, fig.align='center'}
+DoHeatmap(data, features = list_of_markers)
+```
+
+As a result even the final heatmap is a bit imprecise 
+
+# 8 Integration
+
+Integrative analysis can align common cell types and states across multiple datasets, enhancing statistical power and enabling precise comparative analysis. It corrects for technical variations between datasets (such as batch effects) and facilitates comparative scRNA-seq analysis across various experimental conditions.
+
+## 8.1 loading second dataset 
+```{r, warning=F,message=F}
+XUR <- readRDS("XUR.rds")
+EMZ <- readRDS("EMZ.rds") 
+```
+
+
+## 8.2 seurat objects
+```{r, warning=F, message=F}
+XUR <- CreateSeuratObject(counts = XUR,
+                           project = "data", # name of the project
+                           min.cells = 3,   # filter for genes (rows)
+                           min.features = 50 # filter for cells (columns)
+                           )
+XUR
+```
+
+A first inspection revealed that the new objects is composed of 17520 features across 2663 cells
+
+```{r, warning=F, message=F}
+EMZ <- CreateSeuratObject(counts = EMZ,
+                           project = "data", # name of the project
+                           min.cells = 3,   # filter for genes (rows)
+                           min.features = 50 # filter for cells (columns)
+                           )
+EMZ
+```
+
+## 8.3 Merging surat objects
+```{r, warning=F, message=F}
+merged <-  merge(XUR, EMZ)
+
+merged
+```
+
+The merged object contains 18772 features across 4624 cells
+
+## 8.4 QC
+```{r, warning=F, message=F}
+
+merged[["percent_mt"]] <- PercentageFeatureSet(merged, pattern = "^Mt-")
+
+merged[["percent_ribo"]] <- PercentageFeatureSet(merged, "^Rp[SL]")
+
+merged[["percent_ERCC"]] <- PercentageFeatureSet(merged, "^ERCC")
+
+merged$log10GenesPerUMI <- log10(merged$nFeature_RNA)/log10(merged$nCount_RNA)
+
+# Show QC metrics for the first 5 cells
+head(merged@meta.data, 5)
+
+# sum(merged$percent_mt) # = 0
+# sum(merged$percent_ribo) # = 0
+
+```
+
+```{r, fig.align='center', fig.align='center'}
+VlnPlot(merged, features = c("nFeature_RNA","percent_ERCC", "log10GenesPerUMI"))
+```
+
+
+```{r, warning = F, message = F, fig.align="center", fig.width= 10, fig.height= 5}
+DistrFeature_plot <- merged[[]] %>% 
+    ggplot(aes(x=nFeature_RNA, color = orig.ident, fill = orig.ident )) + 
+    geom_density(alpha = 0.2) + 
+    scale_x_log10() + 
+    theme_classic() +
+    ylab("Cell density") +
+    geom_vline(xintercept = 1000) + geom_vline(xintercept = 7500)
+
+# distribution of the complexity
+DistrComplexity_plot <- merged[[]] %>% 
+    ggplot(aes(x=log10GenesPerUMI, color = orig.ident, fill = orig.ident )) + 
+    geom_density(alpha = 0.2) + 
+    scale_x_log10() + 
+    theme_classic() +
+    ylab("Cell density") +
+    geom_vline(xintercept = 0.45) + geom_vline(xintercept = 0.7)
+
+# distribution of the spike-in RNAs
+DistrERCC_plot <- merged[[]] %>% 
+    ggplot(aes(x=percent_ERCC, color = orig.ident, fill = orig.ident )) + 
+    geom_density(alpha = 0.2) + 
+    scale_x_log10() + 
+    theme_classic() +
+    ylab("Cell density") +
+    geom_vline(xintercept = 8)
+
+# distribution of MT
+# DistrMT_plot <- data[[]] %>% 
+#     ggplot(aes(x=percent_mt, color = orig.ident, fill = orig.ident )) + 
+#     geom_density(alpha = 0.2) + 
+#     scale_x_log10() + 
+#     theme_classic() +
+#     ylab("Cell density") +
+#     geom_vline(xintercept = 7.5)
+
+DistrFeature_plot + DistrComplexity_plot + DistrERCC_plot  # + DistrMT_plot
+```
+
+
+## 8.5 filtering
+```{r}
+merged <- subset(merged, subset = nFeature_RNA > 1000 & nFeature_RNA < 7500 &
+                  percent_ERCC < 8 &
+                  log10GenesPerUMI < 0.7 & log10GenesPerUMI > 0.45)
+merged
+```
+
+After filtering the number of cells retaind is decreased from 4624 to 3828.
+
+
+## 8.6 SCTransform
+
+```{r, warning=F,message=F, fig.align='center'}
+
+merged <- SCTransform(merged, method = "glmGamPoi")
+merged <- RunPCA(merged)
+ElbowPlot(merged, ndims = 50)
+
+merged <- RunUMAP(merged, dims = 1:30)
+
+merged <- FindNeighbors(merged, reduction = "pca", dims = 1:20)
+merged <- FindClusters(merged, resolution = 0.4, cluster.name = "pca_clusters")
+```
+30 are the dimension kept in consideration for the next steps.
+
+## 8.7 unintegrated umap
+```{r, fig.align='center', warning=F,message=F}
+merged <- RunUMAP(merged, dims = 1:30, reduction = "pca", reduction.name = "umap.unintegrated")
+# DimPlot(merged, reduction = "umap.unintegrated")
+```
+
+
+
+## 8.8 integration
+
+The IntegrateLayers function also supports SCTransform-normalized data, by setting the normalization.method parameter.
+
+
+### 8.8.1 CCA integration
+```{r}
+merged <- IntegrateLayers(object = merged,
+                          method = CCAIntegration,
+                          normalization.method = "SCT",
+                          orig.reduction = "pca", 
+                          new.reduction = "CCA",
+                          verbose = F)
+
+merged <- FindNeighbors(merged, reduction = "CCA", dims = 1:30)
+merged <- FindClusters(merged, resolution = 0.4, cluster.name = "cca_clusters")
+```
+
+```{r, warning=F,message=F}
+
+merged <- RunUMAP(merged, dims = 1:30, reduction = "CCA", reduction.name = "umap.cca")
+# DimPlot(merged, reduction = "umap.cca", group.by = "cca_clusters")
+
+```
+
+
+
+### 8.8.2 harmony integration
+```{r, warning=F,message=F}
+merged <- IntegrateLayers(object = merged, 
+                        method = HarmonyIntegration,
+                        normalization.method = "SCT",
+                        orig.reduction = "pca", 
+                        new.reduction = "harmony",
+                        verbose = FALSE
+                        )
+```
+
+```{r, warning=F,message=F}
+merged <- FindNeighbors(merged, reduction = "harmony", dims = 1:30)
+merged <- FindClusters(merged, resolution = 0.4,  cluster.name = "harmony_clusters")
+
+merged <- RunUMAP(merged, reduction = "harmony", dims = 1:30, reduction.name = "umap.harmony")
+# DimPlot(merged, reduction = "umap.harmony", group.by = "harmony_clusters")
+
+```
+### 8.8.3 RPCA integration
+```{r, warning=F,message=F}
+merged <- IntegrateLayers(object = merged, 
+                        method = RPCAIntegration,
+                        normalization.method = "SCT",
+                        orig.reduction = "pca", 
+                        new.reduction = "RPCA",
+                        verbose = FALSE
+                        )
+```
+
+```{r, warning=F,message=F}
+merged <- FindNeighbors(merged, reduction = "RPCA", dims = 1:30)
+merged <- FindClusters(merged, resolution = 0.4,  cluster.name = "RPCA_clusters")
+merged <- RunUMAP(merged, reduction = "RPCA", dims = 1:30, reduction.name = "umap.RPCA")
+# DimPlot(merged, reduction = "umap.RPCA", group.by = "RPCA_clusters")
+
+```
+
+
+```{r, warning=F,message=F, fig.height=12, fig.width=20, fig.align='center'}
+p1<-DimPlot(merged, reduction = "umap.unintegrated", group.by="pca_clusters") + ggtitle("Unintegrated")
+p2<-DimPlot(merged, reduction = "umap.cca", group.by = "cca_clusters") +  ggtitle("CCA integrated")
+p3<-DimPlot(merged, reduction = "umap.harmony", group.by = "harmony_clusters") + ggtitle("Harmony integrated")
+p4<-DimPlot(merged, reduction = "umap.RPCA", group.by = "RPCA_clusters") + ggtitle("RPCA integrated")
+
+
+grid.arrange(p1, p2, p3, p4, ncol=2, nrow = 2)
+```
+
+From the plots we can observe that the harmony and RPCA (this two method allow to avoid integrating some points if are too different) performed quite similarly and instead harmony condensed maybe too much since try to integrate every point regardless.  
+
+## 8.9 scType annotation after integration
+
+Prepare marker genes to use for the annotation. 
+```{r, warning=FALSE}
+# DB file
+db_ <- "https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/ScTypeDB_full.xlsx";
+tissue <- "Brain" # e.g. Immune system,Pancreas,Liver,Eye,Kidney,Brain,Lung,Adrenal,Heart,Intestine,Muscle,Placenta,Spleen,Stomach,Thymus 
+
+# load gene set preparation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/gene_sets_prepare.R")
+# prepare gene sets
+gs_list <- gene_sets_prepare(db_, tissue)
+gs_list[["gs_positive"]][5:8] #positive markers
+gs_list[["gs_negative"]][5:8] #negative markers
+
+```
+
+Predicting
+```{r}
+# load cell type annotation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_score_.R")
+
+es.max <- sctype_score(scRNAseqData = merged[["SCT"]]$scale.data, scaled = TRUE, gs = gs_list$gs_positive, gs2 = NULL) # in case there are no negative markers just set gs2 = NULL
+
+# merge by cluster
+cL_resutls <- do.call("rbind", lapply(unique(merged@meta.data$seurat_clusters), function(cl){
+    es.max.cl = sort(rowSums(es.max[ ,rownames(merged@meta.data[merged@meta.data$seurat_clusters==cl, ])]), decreasing = !0)
+    head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(merged@meta.data$seurat_clusters==cl)), 10)
+}))
+sctype_scores <- cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)  
+
+# set low-confident (low ScType score) clusters to "unknown"
+sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/4] <- "Unknown"
+print(sctype_scores[,1:3])
+```
+
+Assign cell types to each cluster
+```{r}
+merged[["scType_labels"]] <- sctype_scores$type[match(merged@meta.data$seurat_clusters, sctype_scores$cluster)]
+```
+
+```{r, warning=F,message=F, fig.height=12, fig.width=20, fig.align='center'}
+p1<-DimPlot(merged, reduction = "umap.unintegrated", group.by="scType_labels") + ggtitle("Unintegrated")
+p2<-DimPlot(merged, reduction = "umap.cca", group.by = "scType_labels") +  ggtitle("CCA integrated")
+p3<-DimPlot(merged, reduction = "umap.harmony", group.by = "scType_labels") + ggtitle("Harmony integrated")
+p4<-DimPlot(merged, reduction = "umap.RPCA", group.by = "scType_labels") + ggtitle("RPCA integrated")
+# p1 | p2 | p3 | p4
+grid.arrange(p1, p2, p3, p4, ncol=2, nrow = 2)
+```
+The presence of lots of unknowns is probably due to the fact that the second dataset is the result of a sequencing performed on a tissue different from Brain
+
+
